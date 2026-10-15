@@ -12,6 +12,7 @@ from bot.keyboards import (
     ItemCB,
     StudentCB,
     admin_menu,
+    browse_by_student_kb,
     homework_admin_kb,
     item_actions_kb,
     lessons_admin_kb,
@@ -180,13 +181,14 @@ async def materials_entry(message: Message, db: Database, settings: Settings) ->
     user = await db.get_user(message.from_user.id)
     if not user or user["role"] != "student":
         return
-    items = await db.list_materials()
+    items = await db.list_materials(message.from_user.id)
     if not items:
         await message.answer("Пока нет справочных материалов.")
         return
-    await message.answer("Справочные материалы:")
+    await message.answer("Ваши справочные материалы:")
     for item in items:
-        await send_item(message.bot, message.chat.id, item, f"📚 {item['title']}")
+        kind = "общий" if item["student_id"] is None else "личный"
+        await send_item(message.bot, message.chat.id, item, f"📚 {item['title']} ({kind})")
 
 
 @router.message(F.text == "📅 Занятия")
@@ -213,25 +215,43 @@ async def lessons_student_entry(message: Message, db: Database, settings: Settin
     await message.answer("\n".join(lines))
 
 
+async def _admin_pick_student_for_list(query: CallbackQuery, db: Database, kind: str, title: str) -> None:
+    students = await db.list_students()
+    pairs = [(s["telegram_id"], student_label(s)) for s in students]
+    await query.message.answer(title, reply_markup=browse_by_student_kb(pairs, kind))
+    await query.answer()
+
+
+async def _admin_send_items(
+    query: CallbackQuery,
+    items: list[dict],
+    kind: str,
+    empty_text: str,
+    header: str,
+) -> None:
+    if not items:
+        await query.message.answer(empty_text)
+        await query.answer()
+        return
+    await query.message.answer(header)
+    mark = "📝" if kind == "hw" else "📚"
+    for item in items:
+        tag = "общее" if item["student_id"] is None else "личное"
+        await send_item(query.bot, query.message.chat.id, item, f"{mark} {item['title']} ({tag})")
+        kb = item_actions_kb(kind, item["id"], can_delete=True)
+        if kb:
+            await query.message.answer("Действия:", reply_markup=kb)
+    await query.answer()
+
+
 @router.callback_query(ItemCB.filter((F.kind == "hw") & (F.action == "list")))
 async def admin_hw_list(query: CallbackQuery, db: Database, settings: Settings) -> None:
     if not _is_admin(query.from_user.id, settings):
         await query.answer("Нет доступа", show_alert=True)
         return
-    items = await db.list_homework()
-    if not items:
-        await query.message.answer("Заданий ещё нет.")
-        await query.answer()
-        return
-    await query.message.answer("Последние домашние задания:")
-    for item in items:
-        who = "всем" if item["student_id"] is None else f"ученику {item['student_id']}"
-        header = f"📝 {item['title']} ({who})"
-        await send_item(query.bot, query.message.chat.id, item, header)
-        kb = item_actions_kb("hw", item["id"], can_delete=True)
-        if kb:
-            await query.message.answer("Действия:", reply_markup=kb)
-    await query.answer()
+    await _admin_pick_student_for_list(
+        query, db, "hw", "Чьи домашние задания открыть?"
+    )
 
 
 @router.callback_query(ItemCB.filter((F.kind == "mat") & (F.action == "list")))
@@ -239,18 +259,59 @@ async def admin_mat_list(query: CallbackQuery, db: Database, settings: Settings)
     if not _is_admin(query.from_user.id, settings):
         await query.answer("Нет доступа", show_alert=True)
         return
-    items = await db.list_materials()
-    if not items:
-        await query.message.answer("Материалов ещё нет.")
-        await query.answer()
+    await _admin_pick_student_for_list(
+        query, db, "mat", "Чьи справочные материалы открыть?"
+    )
+
+
+@router.callback_query(ItemCB.filter((F.kind == "hw") & (F.action == "of")))
+async def admin_hw_of_student(
+    query: CallbackQuery, callback_data: ItemCB, db: Database, settings: Settings
+) -> None:
+    if not _is_admin(query.from_user.id, settings):
+        await query.answer("Нет доступа", show_alert=True)
         return
-    await query.message.answer("Справочные материалы:")
-    for item in items:
-        await send_item(query.bot, query.message.chat.id, item, f"📚 {item['title']}")
-        kb = item_actions_kb("mat", item["id"], can_delete=True)
-        if kb:
-            await query.message.answer("Действия:", reply_markup=kb)
-    await query.answer()
+    if callback_data.iid == 0:
+        items = await db.list_homework(shared_only=True)
+        await _admin_send_items(
+            query, items, "hw", "Общих заданий пока нет.", "Общие домашние задания (для всех):"
+        )
+        return
+    student = await db.get_user(callback_data.iid)
+    name = student_label(student) if student else str(callback_data.iid)
+    items = await db.list_homework(callback_data.iid)
+    await _admin_send_items(
+        query,
+        items,
+        "hw",
+        f"У {name} пока нет домашних заданий.",
+        f"Домашние задания ученика {name}:",
+    )
+
+
+@router.callback_query(ItemCB.filter((F.kind == "mat") & (F.action == "of")))
+async def admin_mat_of_student(
+    query: CallbackQuery, callback_data: ItemCB, db: Database, settings: Settings
+) -> None:
+    if not _is_admin(query.from_user.id, settings):
+        await query.answer("Нет доступа", show_alert=True)
+        return
+    if callback_data.iid == 0:
+        items = await db.list_materials(shared_only=True)
+        await _admin_send_items(
+            query, items, "mat", "Общих материалов пока нет.", "Общие справочные материалы (для всех):"
+        )
+        return
+    student = await db.get_user(callback_data.iid)
+    name = student_label(student) if student else str(callback_data.iid)
+    items = await db.list_materials(callback_data.iid)
+    await _admin_send_items(
+        query,
+        items,
+        "mat",
+        f"У {name} пока нет справочных материалов.",
+        f"Справочные материалы ученика {name}:",
+    )
 
 
 @router.callback_query(ItemCB.filter((F.kind == "ls") & (F.action == "list")))
@@ -266,7 +327,10 @@ async def admin_ls_list(query: CallbackQuery, db: Database, settings: Settings) 
     await query.message.answer("Ближайшие занятия:")
     for lesson in lessons:
         text = lesson_text(lesson, settings.tz, for_student=False)
-        await query.message.answer(text, reply_markup=item_actions_kb("ls", lesson["id"], can_delete=True))
+        await query.message.answer(
+            text,
+            reply_markup=item_actions_kb("ls", lesson["id"], can_delete=True, can_edit=True),
+        )
     await query.answer()
 
 

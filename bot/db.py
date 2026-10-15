@@ -42,7 +42,9 @@ CREATE TABLE IF NOT EXISTS materials (
     body TEXT,
     file_id TEXT,
     file_kind TEXT,
-    created_at TEXT NOT NULL
+    student_id INTEGER,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (student_id) REFERENCES users(telegram_id)
 );
 
 CREATE TABLE IF NOT EXISTS lessons (
@@ -74,7 +76,14 @@ class Database:
         self._conn = await aiosqlite.connect(self.path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
+        await self._migrate()
         await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        cur = await self.conn.execute("PRAGMA table_info(materials)")
+        cols = {row[1] for row in await cur.fetchall()}
+        if "student_id" not in cols:
+            await self.conn.execute("ALTER TABLE materials ADD COLUMN student_id INTEGER")
 
     async def close(self) -> None:
         if self._conn:
@@ -121,6 +130,7 @@ class Database:
 
     async def remove_student(self, telegram_id: int) -> bool:
         await self.conn.execute("DELETE FROM homework WHERE student_id = ?", (telegram_id,))
+        await self.conn.execute("DELETE FROM materials WHERE student_id = ?", (telegram_id,))
         await self.conn.execute("DELETE FROM lessons WHERE student_id = ?", (telegram_id,))
         cur = await self.conn.execute(
             "DELETE FROM users WHERE telegram_id = ? AND role = 'student'",
@@ -171,8 +181,17 @@ class Database:
         await self.conn.commit()
         return cur.lastrowid
 
-    async def list_homework(self, student_id: int | None = None) -> list[dict[str, Any]]:
-        if student_id is None:
+    async def list_homework(
+        self,
+        student_id: int | None = None,
+        *,
+        shared_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        if shared_only:
+            cur = await self.conn.execute(
+                "SELECT * FROM homework WHERE student_id IS NULL ORDER BY id DESC LIMIT 30"
+            )
+        elif student_id is None:
             cur = await self.conn.execute(
                 "SELECT * FROM homework ORDER BY id DESC LIMIT 30"
             )
@@ -203,21 +222,41 @@ class Database:
         body: str | None,
         file_id: str | None,
         file_kind: str | None,
+        student_id: int | None,
     ) -> int:
         cur = await self.conn.execute(
             """
-            INSERT INTO materials (title, body, file_id, file_kind, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO materials (title, body, file_id, file_kind, student_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (title, body, file_id, file_kind, _now(self.tz)),
+            (title, body, file_id, file_kind, student_id, _now(self.tz)),
         )
         await self.conn.commit()
         return cur.lastrowid
 
-    async def list_materials(self) -> list[dict[str, Any]]:
-        cur = await self.conn.execute(
-            "SELECT * FROM materials ORDER BY id DESC LIMIT 30"
-        )
+    async def list_materials(
+        self,
+        student_id: int | None = None,
+        *,
+        shared_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        if shared_only:
+            cur = await self.conn.execute(
+                "SELECT * FROM materials WHERE student_id IS NULL ORDER BY id DESC LIMIT 30"
+            )
+        elif student_id is None:
+            cur = await self.conn.execute(
+                "SELECT * FROM materials ORDER BY id DESC LIMIT 30"
+            )
+        else:
+            cur = await self.conn.execute(
+                """
+                SELECT * FROM materials
+                WHERE student_id IS NULL OR student_id = ?
+                ORDER BY id DESC LIMIT 30
+                """,
+                (student_id,),
+            )
         return [dict(r) for r in await cur.fetchall()]
 
     async def get_material(self, mid: int) -> dict[str, Any] | None:
@@ -289,6 +328,21 @@ class Database:
         )
         row = await cur.fetchone()
         return dict(row) if row else None
+
+    async def update_lesson_starts(self, lid: int, starts_at: datetime) -> bool:
+        cur = await self.conn.execute(
+            """
+            UPDATE lessons
+            SET starts_at = ?,
+                notified_day = 0,
+                notified_hour = 0,
+                notified_start = 0
+            WHERE id = ? AND status = 'scheduled'
+            """,
+            (starts_at.isoformat(), lid),
+        )
+        await self.conn.commit()
+        return cur.rowcount > 0
 
     async def cancel_lesson(self, lid: int) -> bool:
         cur = await self.conn.execute(

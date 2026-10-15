@@ -10,6 +10,7 @@ class AddHomework(StatesGroup):
 class AddMaterial(StatesGroup):
     title = State()
     content = State()
+    audience = State()
 
 
 class ScheduleLesson(StatesGroup):
@@ -17,3 +18,8 @@ class ScheduleLesson(StatesGroup):
     date = State()
     time = State()
     topic = State()
+
+
+class RescheduleLesson(StatesGroup):
+    date = State()
+    time = State()

@@ -141,32 +141,53 @@ def lessons_admin_kb() -> InlineKeyboardMarkup:
     )
 
 
-def homework_audience_kb() -> InlineKeyboardMarkup:
+def audience_kb(kind: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="Всем ученикам",
-                    callback_data=ItemCB(kind="hw", action="aud", iid=0).pack(),
+                    callback_data=ItemCB(kind=kind, action="aud", iid=0).pack(),
                 )
             ],
             [
                 InlineKeyboardButton(
                     text="Выбрать ученика",
-                    callback_data=ItemCB(kind="hw", action="pick").pack(),
+                    callback_data=ItemCB(kind=kind, action="pick").pack(),
                 )
             ],
         ]
     )
 
 
+def browse_by_student_kb(students: list[tuple[int, str]], kind: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                text="🌐 Общие (для всех)",
+                callback_data=ItemCB(kind=kind, action="of", iid=0).pack(),
+            )
+        ]
+    ]
+    for sid, name in students:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=name,
+                    callback_data=ItemCB(kind=kind, action="of", iid=sid).pack(),
+                )
+            ]
+        )
+    if len(rows) == 1 and not students:
+        rows.append([InlineKeyboardButton(text="Нет учеников", callback_data="noop")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def students_pick_kb(students: list[tuple[int, str]], action: str, kind: str = "st") -> InlineKeyboardMarkup:
     rows = []
     for sid, name in students:
-        if kind == "hw":
-            data = ItemCB(kind="hw", action=action, iid=sid).pack()
-        elif kind == "ls":
-            data = ItemCB(kind="ls", action=action, iid=sid).pack()
+        if kind in {"hw", "ls", "mat"}:
+            data = ItemCB(kind=kind, action=action, iid=sid).pack()
         else:
             data = StudentCB(action=action, sid=sid).pack()
         rows.append([InlineKeyboardButton(text=name, callback_data=data)])
@@ -175,8 +196,19 @@ def students_pick_kb(students: list[tuple[int, str]], action: str, kind: str = "
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def item_actions_kb(kind: str, iid: int, *, can_delete: bool) -> InlineKeyboardMarkup:
+def item_actions_kb(
+    kind: str, iid: int, *, can_delete: bool, can_edit: bool = False
+) -> InlineKeyboardMarkup | None:
     rows = []
+    if can_edit:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="✏️ Изменить дату и время",
+                    callback_data=ItemCB(kind=kind, action="edit", iid=iid).pack(),
+                )
+            ]
+        )
     if can_delete:
         rows.append(
             [
