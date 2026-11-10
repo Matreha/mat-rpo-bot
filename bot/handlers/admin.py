@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from aiogram import F, Router
+from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
@@ -17,6 +18,7 @@ from bot.keyboards import (
     skip_or_cancel_kb,
     students_pick_kb,
 )
+from bot.pickers import CalCB, ClockCB, calendar_kb, hour_clock_kb, minute_clock_kb, parse_state_date
 from bot.scheduler import lesson_text
 from bot.states import AddHomework, AddMaterial, RescheduleLesson, ScheduleLesson
 
@@ -241,51 +243,193 @@ async def ls_add_start(query: CallbackQuery, state: FSMContext, db: Database, se
     await query.answer()
 
 
+async def _send_calendar(message, settings: Settings, intro: str) -> None:
+    now = datetime.now(settings.tz)
+    await message.answer(intro, reply_markup=cancel_kb())
+    await message.answer("Календарь:", reply_markup=calendar_kb(now.year, now.month, now.date()))
+
+
 @router.callback_query(ScheduleLesson.student, ItemCB.filter((F.kind == "ls") & (F.action == "pick")))
 async def ls_pick(query: CallbackQuery, callback_data: ItemCB, state: FSMContext, settings: Settings) -> None:
     if not _guard_admin(query.from_user.id, settings):
         return
     await state.update_data(student_id=callback_data.iid)
     await state.set_state(ScheduleLesson.date)
-    await query.message.answer(
-        "Введите дату занятия в формате ДД.ММ.ГГГГ, например 02.09.2026",
-        reply_markup=cancel_kb(),
+    await _send_calendar(query.message, settings, "Выберите дату занятия на календаре.")
+    await query.answer()
+
+
+@router.callback_query(CalCB.filter(F.a == "i"))
+@router.callback_query(ClockCB.filter(F.a == "i"))
+async def picker_ignore(query: CallbackQuery) -> None:
+    await query.answer()
+
+
+@router.callback_query(
+    CalCB.filter(F.a.in_({"p", "n"})),
+    StateFilter(ScheduleLesson.date, RescheduleLesson.date),
+)
+async def cal_nav(query: CallbackQuery, callback_data: CalCB, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
+        return
+    today = datetime.now(settings.tz).date()
+    await query.message.edit_reply_markup(reply_markup=calendar_kb(callback_data.y, callback_data.m, today))
+    await query.answer()
+
+
+@router.callback_query(
+    CalCB.filter(F.a == "d"),
+    StateFilter(ScheduleLesson.date, RescheduleLesson.date),
+)
+async def cal_day(query: CallbackQuery, callback_data: CalCB, state: FSMContext, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
+        return
+    chosen = datetime(callback_data.y, callback_data.m, callback_data.d).date()
+    now = datetime.now(settings.tz)
+    await state.update_data(date=chosen.isoformat())
+    current = await state.get_state()
+    if current == ScheduleLesson.date.state:
+        await state.set_state(ScheduleLesson.time)
+    else:
+        await state.set_state(RescheduleLesson.time)
+    pm = True if chosen > now.date() else now.hour >= 12
+    pretty = chosen.strftime("%d.%m.%Y")
+    await query.message.edit_text(
+        f"Дата: {pretty}\nВыберите час на циферблате:",
+        reply_markup=hour_clock_kb(chosen, now, pm=pm),
     )
     await query.answer()
 
 
-@router.message(ScheduleLesson.date, F.text, F.text != "❌ Отмена")
-async def ls_date(message: Message, state: FSMContext) -> None:
-    try:
-        datetime.strptime(message.text.strip(), "%d.%m.%Y")
-    except ValueError:
-        await message.answer("Не получилось прочитать дату. Пример: 02.09.2026")
-        return
-    await state.update_data(date=message.text.strip())
-    await state.set_state(ScheduleLesson.time)
-    await message.answer("Введите время в формате ЧЧ:ММ, например 18:30")
-
-
-@router.message(ScheduleLesson.time, F.text, F.text != "❌ Отмена")
-async def ls_time(message: Message, state: FSMContext, settings: Settings) -> None:
-    try:
-        datetime.strptime(message.text.strip(), "%H:%M")
-    except ValueError:
-        await message.answer("Не получилось прочитать время. Пример: 18:30")
+@router.callback_query(
+    ClockCB.filter(F.a == "p"),
+    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
+)
+async def clock_period(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
         return
     data = await state.get_data()
-    starts = datetime.strptime(f"{data['date']} {message.text.strip()}", "%d.%m.%Y %H:%M")
-    starts = starts.replace(tzinfo=settings.tz)
-    if starts <= datetime.now(settings.tz):
-        await message.answer("Это время уже прошло. Укажите дату и время заново, начиная с даты.")
-        await state.set_state(ScheduleLesson.date)
+    chosen = parse_state_date(data["date"])
+    now = datetime.now(settings.tz)
+    await query.message.edit_reply_markup(reply_markup=hour_clock_kb(chosen, now, pm=bool(callback_data.p)))
+    await query.answer()
+
+
+@router.callback_query(
+    ClockCB.filter(F.a == "h"),
+    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
+)
+async def clock_hour(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
         return
-    await state.update_data(starts_at=starts.isoformat())
-    await state.set_state(ScheduleLesson.topic)
-    await message.answer(
-        "Тема занятия (или нажмите «Пропустить»).",
-        reply_markup=skip_or_cancel_kb(),
+    data = await state.get_data()
+    chosen = parse_state_date(data["date"])
+    now = datetime.now(settings.tz)
+    pretty = chosen.strftime("%d.%m.%Y")
+    await query.message.edit_text(
+        f"Дата: {pretty}\nЧас: {callback_data.v:02d}\nВыберите минуты на циферблате:",
+        reply_markup=minute_clock_kb(chosen, callback_data.v, now),
     )
+    await query.answer()
+
+
+@router.callback_query(
+    ClockCB.filter(F.a == "b"),
+    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
+)
+async def clock_back_calendar(query: CallbackQuery, state: FSMContext, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
+        return
+    current = await state.get_state()
+    if current == ScheduleLesson.time.state:
+        await state.set_state(ScheduleLesson.date)
+    else:
+        await state.set_state(RescheduleLesson.date)
+    now = datetime.now(settings.tz)
+    await query.message.edit_text("Календарь:", reply_markup=calendar_kb(now.year, now.month, now.date()))
+    await query.answer()
+
+
+@router.callback_query(
+    ClockCB.filter(F.a == "n"),
+    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
+)
+async def clock_back_hours(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
+    if not _guard_admin(query.from_user.id, settings):
+        return
+    data = await state.get_data()
+    chosen = parse_state_date(data["date"])
+    now = datetime.now(settings.tz)
+    pretty = chosen.strftime("%d.%m.%Y")
+    await query.message.edit_text(
+        f"Дата: {pretty}\nВыберите час на циферблате:",
+        reply_markup=hour_clock_kb(chosen, now, pm=bool(callback_data.p)),
+    )
+    await query.answer()
+
+
+@router.callback_query(
+    ClockCB.filter(F.a == "m"),
+    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
+)
+async def clock_minute(
+    query: CallbackQuery,
+    callback_data: ClockCB,
+    state: FSMContext,
+    db: Database,
+    settings: Settings,
+) -> None:
+    if not _guard_admin(query.from_user.id, settings):
+        return
+    data = await state.get_data()
+    chosen = parse_state_date(data["date"])
+    starts = datetime(
+        chosen.year,
+        chosen.month,
+        chosen.day,
+        callback_data.h,
+        callback_data.v,
+        tzinfo=settings.tz,
+    )
+    now = datetime.now(settings.tz)
+    if starts <= now:
+        await query.answer("Это время уже прошло. Выберите другое.", show_alert=True)
+        return
+    current = await state.get_state()
+    if current == ScheduleLesson.time.state:
+        await state.update_data(starts_at=starts.isoformat())
+        await state.set_state(ScheduleLesson.topic)
+        pretty = starts.strftime("%d.%m.%Y в %H:%M")
+        await query.message.edit_text(f"Занятие на {pretty}.")
+        await query.message.answer(
+            "Тема занятия (или нажмите «Пропустить»).",
+            reply_markup=skip_or_cancel_kb(),
+        )
+        await query.answer()
+        return
+
+    old = await db.get_lesson(data["lesson_id"])
+    ok = await db.update_lesson_starts(data["lesson_id"], starts)
+    await state.clear()
+    if not ok or not old:
+        await query.message.edit_text("Не удалось изменить занятие. Возможно, его уже отменили.")
+        await query.message.answer("Можно выбрать другое действие.", reply_markup=admin_menu())
+        await query.answer()
+        return
+    lesson = await db.get_lesson(data["lesson_id"])
+    await query.message.edit_text("Занятие перенесено.\n" + lesson_text(lesson, settings.tz, for_student=False))
+    await query.message.answer("Готово.", reply_markup=admin_menu())
+    try:
+        await query.bot.send_message(
+            old["student_id"],
+            "Занятие перенесено.\nБыло:\n"
+            + lesson_text(old, settings.tz, for_student=True)
+            + "\n\nСтало:\n"
+            + lesson_text(lesson, settings.tz, for_student=True),
+        )
+    except Exception:
+        await query.message.answer("Ученику не удалось сразу написать о переносе.")
+    await query.answer()
 
 
 @router.message(ScheduleLesson.topic, F.text, F.text != "❌ Отмена")
@@ -332,61 +476,11 @@ async def ls_edit_start(
         return
     await state.set_state(RescheduleLesson.date)
     await state.update_data(lesson_id=callback_data.iid)
-    await query.message.answer(
+    await _send_calendar(
+        query.message,
+        settings,
         "Текущее время:\n"
         + lesson_text(lesson, settings.tz, for_student=False)
-        + "\n\nВведите новую дату в формате ДД.ММ.ГГГГ, например 02.09.2026",
-        reply_markup=cancel_kb(),
+        + "\n\nВыберите новую дату на календаре.",
     )
     await query.answer()
-
-
-@router.message(RescheduleLesson.date, F.text, F.text != "❌ Отмена")
-async def ls_edit_date(message: Message, state: FSMContext) -> None:
-    try:
-        datetime.strptime(message.text.strip(), "%d.%m.%Y")
-    except ValueError:
-        await message.answer("Не получилось прочитать дату. Пример: 02.09.2026")
-        return
-    await state.update_data(date=message.text.strip())
-    await state.set_state(RescheduleLesson.time)
-    await message.answer("Введите новое время в формате ЧЧ:ММ, например 18:30")
-
-
-@router.message(RescheduleLesson.time, F.text, F.text != "❌ Отмена")
-async def ls_edit_time(message: Message, state: FSMContext, db: Database, settings: Settings) -> None:
-    if not _guard_admin(message.from_user.id, settings):
-        return
-    try:
-        datetime.strptime(message.text.strip(), "%H:%M")
-    except ValueError:
-        await message.answer("Не получилось прочитать время. Пример: 18:30")
-        return
-    data = await state.get_data()
-    starts = datetime.strptime(f"{data['date']} {message.text.strip()}", "%d.%m.%Y %H:%M")
-    starts = starts.replace(tzinfo=settings.tz)
-    if starts <= datetime.now(settings.tz):
-        await message.answer("Это время уже прошло. Укажите дату заново.")
-        await state.set_state(RescheduleLesson.date)
-        return
-    old = await db.get_lesson(data["lesson_id"])
-    ok = await db.update_lesson_starts(data["lesson_id"], starts)
-    await state.clear()
-    if not ok or not old:
-        await message.answer("Не удалось изменить занятие. Возможно, его уже отменили.", reply_markup=admin_menu())
-        return
-    lesson = await db.get_lesson(data["lesson_id"])
-    await message.answer(
-        "Занятие перенесено.\n" + lesson_text(lesson, settings.tz, for_student=False),
-        reply_markup=admin_menu(),
-    )
-    try:
-        await message.bot.send_message(
-            old["student_id"],
-            "Занятие перенесено.\nБыло:\n"
-            + lesson_text(old, settings.tz, for_student=True)
-            + "\n\nСтало:\n"
-            + lesson_text(lesson, settings.tz, for_student=True),
-        )
-    except Exception:
-        await message.answer("Ученику не удалось сразу написать о переносе.")
