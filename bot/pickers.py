@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import calendar
 from datetime import date, datetime
-from zoneinfo import ZoneInfo
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
@@ -25,22 +24,8 @@ MONTHS_RU = (
 
 WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
-HOUR_POS = {
-    12: (0, 2),
-    1: (0, 4),
-    2: (1, 4),
-    3: (2, 4),
-    4: (3, 4),
-    5: (4, 4),
-    6: (4, 2),
-    7: (4, 0),
-    8: (3, 0),
-    9: (2, 0),
-    10: (1, 0),
-    11: (0, 0),
-}
-
-MINUTE_AT_HOUR = {12: 0, 1: 5, 2: 10, 3: 15, 4: 20, 5: 25, 6: 30, 7: 35, 8: 40, 9: 45, 10: 50, 11: 55}
+TIME_STEP_MIN = 30
+TIME_VISIBLE = 3
 
 
 class CalCB(CallbackData, prefix="cal"):
@@ -51,10 +36,8 @@ class CalCB(CallbackData, prefix="cal"):
 
 
 class ClockCB(CallbackData, prefix="clk"):
-    a: str  # h hour, m minute, p period, b back calendar, n back hours, i ignore
+    a: str  # s select, l left, r right, b back calendar, i ignore
     v: int = 0
-    h: int = 0
-    p: int = 0
 
 
 def _shift_month(year: int, month: int, delta: int) -> tuple[int, int]:
@@ -114,75 +97,73 @@ def calendar_kb(year: int, month: int, today: date) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _face_rows(buttons: dict[tuple[int, int], InlineKeyboardButton], center: InlineKeyboardButton) -> list[list[InlineKeyboardButton]]:
-    grid: dict[tuple[int, int], InlineKeyboardButton] = dict(buttons)
-    grid[(2, 2)] = center
-    rows = []
-    for r in range(5):
-        row = []
-        for c in range(5):
-            row.append(grid.get((r, c), _blank("clk")))
-        rows.append(row)
-    return rows
+def available_times(selected_date: date, now: datetime) -> list[int]:
+    slots = list(range(0, 24 * 60, TIME_STEP_MIN))
+    if selected_date > now.date():
+        return slots
+    if selected_date < now.date():
+        return []
+    current = now.hour * 60 + now.minute
+    return [slot for slot in slots if slot > current]
 
 
-def hour_clock_kb(selected_date: date, now: datetime, *, pm: bool) -> InlineKeyboardMarkup:
-    today = now.date()
-    buttons: dict[tuple[int, int], InlineKeyboardButton] = {}
-    for face in range(1, 13):
-        hour24 = (0 if face == 12 else face) + (12 if pm else 0)
-        disabled = selected_date < today or (selected_date == today and hour24 < now.hour)
-        pos = HOUR_POS[face]
-        label = f"{hour24:02d}"
-        if disabled:
-            buttons[pos] = InlineKeyboardButton(text="·", callback_data=ClockCB(a="i").pack())
-        else:
-            buttons[pos] = InlineKeyboardButton(
-                text=label,
-                callback_data=ClockCB(a="h", v=hour24, p=int(pm)).pack(),
-            )
-    center = InlineKeyboardButton(text="●", callback_data=ClockCB(a="i").pack())
-    rows = _face_rows(buttons, center)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="☀️ 00–11" if not pm else "00–11",
-                callback_data=ClockCB(a="p", p=0).pack(),
-            ),
-            InlineKeyboardButton(
-                text="🌙 12–23" if pm else "12–23",
-                callback_data=ClockCB(a="p", p=1).pack(),
-            ),
-        ]
-    )
-    rows.append(
-        [InlineKeyboardButton(text="← Календарь", callback_data=ClockCB(a="b").pack())]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def default_time_start(selected_date: date, now: datetime) -> int:
+    slots = available_times(selected_date, now)
+    if not slots:
+        return 0
+    prefer = 18 * 60
+    for index, slot in enumerate(slots):
+        if slot >= prefer:
+            return index
+    return 0
 
 
-def minute_clock_kb(selected_date: date, hour24: int, now: datetime) -> InlineKeyboardMarkup:
-    today = now.date()
-    buttons: dict[tuple[int, int], InlineKeyboardButton] = {}
-    for face, minute in MINUTE_AT_HOUR.items():
-        disabled = selected_date < today or (
-            selected_date == today and (hour24 < now.hour or (hour24 == now.hour and minute <= now.minute))
+def time_scroll_kb(selected_date: date, now: datetime, start: int) -> InlineKeyboardMarkup:
+    slots = available_times(selected_date, now)
+    back = [InlineKeyboardButton(text="← Календарь", callback_data=ClockCB(a="b").pack())]
+    if not slots:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="На сегодня свободного времени нет", callback_data=ClockCB(a="i").pack())],
+                back,
+            ]
         )
-        pos = HOUR_POS[face]
-        label = f"{minute:02d}"
-        if disabled:
-            buttons[pos] = InlineKeyboardButton(text="·", callback_data=ClockCB(a="i").pack())
-        else:
-            buttons[pos] = InlineKeyboardButton(
-                text=label,
-                callback_data=ClockCB(a="m", v=minute, h=hour24).pack(),
+
+    max_start = max(0, len(slots) - TIME_VISIBLE)
+    start = max(0, min(start, max_start))
+    window = slots[start : start + TIME_VISIBLE]
+
+    row: list[InlineKeyboardButton] = []
+    if start > 0:
+        row.append(
+            InlineKeyboardButton(
+                text="‹",
+                callback_data=ClockCB(a="l", v=start - 1).pack(),
             )
-    center = InlineKeyboardButton(text=f"{hour24:02d}:", callback_data=ClockCB(a="i").pack())
-    rows = _face_rows(buttons, center)
-    rows.append(
-        [InlineKeyboardButton(text="← Часы", callback_data=ClockCB(a="n", p=int(hour24 >= 12)).pack())]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+        )
+    else:
+        row.append(_blank("clk"))
+
+    for minutes in window:
+        hour, minute = divmod(minutes, 60)
+        row.append(
+            InlineKeyboardButton(
+                text=f"{hour:02d}:{minute:02d}",
+                callback_data=ClockCB(a="s", v=minutes).pack(),
+            )
+        )
+
+    if start < max_start:
+        row.append(
+            InlineKeyboardButton(
+                text="›",
+                callback_data=ClockCB(a="r", v=start + 1).pack(),
+            )
+        )
+    else:
+        row.append(_blank("clk"))
+
+    return InlineKeyboardMarkup(inline_keyboard=[row, back])
 
 
 def parse_state_date(raw: str) -> date:

@@ -18,7 +18,7 @@ from bot.keyboards import (
     skip_or_cancel_kb,
     students_pick_kb,
 )
-from bot.pickers import CalCB, ClockCB, calendar_kb, hour_clock_kb, minute_clock_kb, parse_state_date
+from bot.pickers import CalCB, ClockCB, calendar_kb, default_time_start, parse_state_date, time_scroll_kb
 from bot.scheduler import lesson_text
 from bot.states import AddHomework, AddMaterial, RescheduleLesson, ScheduleLesson
 
@@ -292,44 +292,25 @@ async def cal_day(query: CallbackQuery, callback_data: CalCB, state: FSMContext,
         await state.set_state(ScheduleLesson.time)
     else:
         await state.set_state(RescheduleLesson.time)
-    pm = True if chosen > now.date() else now.hour >= 12
     pretty = chosen.strftime("%d.%m.%Y")
     await query.message.edit_text(
-        f"Дата: {pretty}\nВыберите час на циферблате:",
-        reply_markup=hour_clock_kb(chosen, now, pm=pm),
+        f"Дата: {pretty}\nПрокрутите линейку и нажмите время:",
+        reply_markup=time_scroll_kb(chosen, now, default_time_start(chosen, now)),
     )
     await query.answer()
 
 
 @router.callback_query(
-    ClockCB.filter(F.a == "p"),
+    ClockCB.filter(F.a.in_({"l", "r"})),
     StateFilter(ScheduleLesson.time, RescheduleLesson.time),
 )
-async def clock_period(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
+async def time_scroll(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
     if not _guard_admin(query.from_user.id, settings):
         return
     data = await state.get_data()
     chosen = parse_state_date(data["date"])
     now = datetime.now(settings.tz)
-    await query.message.edit_reply_markup(reply_markup=hour_clock_kb(chosen, now, pm=bool(callback_data.p)))
-    await query.answer()
-
-
-@router.callback_query(
-    ClockCB.filter(F.a == "h"),
-    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
-)
-async def clock_hour(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
-    if not _guard_admin(query.from_user.id, settings):
-        return
-    data = await state.get_data()
-    chosen = parse_state_date(data["date"])
-    now = datetime.now(settings.tz)
-    pretty = chosen.strftime("%d.%m.%Y")
-    await query.message.edit_text(
-        f"Дата: {pretty}\nЧас: {callback_data.v:02d}\nВыберите минуты на циферблате:",
-        reply_markup=minute_clock_kb(chosen, callback_data.v, now),
-    )
+    await query.message.edit_reply_markup(reply_markup=time_scroll_kb(chosen, now, callback_data.v))
     await query.answer()
 
 
@@ -351,28 +332,10 @@ async def clock_back_calendar(query: CallbackQuery, state: FSMContext, settings:
 
 
 @router.callback_query(
-    ClockCB.filter(F.a == "n"),
+    ClockCB.filter(F.a == "s"),
     StateFilter(ScheduleLesson.time, RescheduleLesson.time),
 )
-async def clock_back_hours(query: CallbackQuery, callback_data: ClockCB, state: FSMContext, settings: Settings) -> None:
-    if not _guard_admin(query.from_user.id, settings):
-        return
-    data = await state.get_data()
-    chosen = parse_state_date(data["date"])
-    now = datetime.now(settings.tz)
-    pretty = chosen.strftime("%d.%m.%Y")
-    await query.message.edit_text(
-        f"Дата: {pretty}\nВыберите час на циферблате:",
-        reply_markup=hour_clock_kb(chosen, now, pm=bool(callback_data.p)),
-    )
-    await query.answer()
-
-
-@router.callback_query(
-    ClockCB.filter(F.a == "m"),
-    StateFilter(ScheduleLesson.time, RescheduleLesson.time),
-)
-async def clock_minute(
+async def time_select(
     query: CallbackQuery,
     callback_data: ClockCB,
     state: FSMContext,
@@ -383,12 +346,13 @@ async def clock_minute(
         return
     data = await state.get_data()
     chosen = parse_state_date(data["date"])
+    hour, minute = divmod(callback_data.v, 60)
     starts = datetime(
         chosen.year,
         chosen.month,
         chosen.day,
-        callback_data.h,
-        callback_data.v,
+        hour,
+        minute,
         tzinfo=settings.tz,
     )
     now = datetime.now(settings.tz)
